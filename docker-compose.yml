@@ -1,0 +1,29 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - oauth_network
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    networks:
+      - oauth_network
+    depends_on:
+      - redis
+
+volumes:
+  redis_data:
+
+networks:
+  oauth_network:
+    driver: bridge

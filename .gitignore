@@ -1,0 +1,35 @@
+# .NET Core
+bin/
+obj/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+.vs/
+.vscode/
+*.swp
+*.swo
+
+# Environment Files
+appsettings.Development.json
+appsettings.Production.json
+*.Development.json
+*.Production.json
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+*.sln.iml
+
+# macOS
+.DS_Store
+
+# Certificates and secrets
+*.pfx
+*.key
+*.pem
+*.cert
+*.crt
