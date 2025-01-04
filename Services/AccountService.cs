@@ -1,19 +1,20 @@
 using Microsoft.AspNetCore.Identity;
-using OpenIddict.Abstractions;
-using OpenIddict.Core;
 using OAuthServer.Models;
+using OAuthServer.Services.Interfaces;
+using OpenIddict.Abstractions;
 using System.Security.Claims;
+using System.Collections.Generic;
 using System.Collections.Immutable;
-using Microsoft.EntityFrameworkCore;
+using System.Linq;
 
 namespace OAuthServer.Services;
 
-public class AccountService
+public class AccountService : IAccountService
 {
     private readonly SignInManager<ApplicationUser> _signInManager;
     private readonly UserManager<ApplicationUser> _userManager;
-    private readonly TokenService _tokenService;
-    private readonly SessionService _sessionService;
+    private readonly ITokenService _tokenService;
+    private readonly ISessionService _sessionService;
     private readonly IOpenIddictApplicationManager _applicationManager;
     private readonly IOpenIddictAuthorizationManager _authorizationManager;
     private readonly IOpenIddictScopeManager _scopeManager;
@@ -21,8 +22,8 @@ public class AccountService
     public AccountService(
         SignInManager<ApplicationUser> signInManager,
         UserManager<ApplicationUser> userManager,
-        TokenService tokenService,
-        SessionService sessionService,
+        ITokenService tokenService,
+        ISessionService sessionService,
         IOpenIddictApplicationManager applicationManager,
         IOpenIddictAuthorizationManager authorizationManager,
         IOpenIddictScopeManager scopeManager)
@@ -34,64 +35,6 @@ public class AccountService
         _applicationManager = applicationManager;
         _authorizationManager = authorizationManager;
         _scopeManager = scopeManager;
-    }
-
-    public async Task<(bool success, string? error, AuthenticationResult? result)> AuthenticateAsync(TokenRequest request)
-    {
-        if (!_tokenService.ValidateClientCredentials(request.ClientId, request.ClientSecret, request.ClientType))
-        {
-            return (false, "Invalid client credentials", null);
-        }
-
-        var user = await _userManager.FindByEmailAsync(request.Email);
-        if (user == null)
-        {
-            return (false, "Invalid credentials", null);
-        }
-
-        var result = await _signInManager.CheckPasswordSignInAsync(user, request.Password, false);
-        if (!result.Succeeded)
-        {
-            return (false, "Invalid credentials", null);
-        }
-
-        var authResult = await GenerateAuthenticationResultAsync(user, request.ClientType);
-        return (true, null, authResult);
-    }
-
-    public async Task<(bool success, string? error, AuthenticationResult? result)> RefreshTokenAsync(RefreshTokenRequest request)
-    {
-        if (!_tokenService.ValidateClientCredentials(request.ClientId, request.ClientSecret, request.ClientType))
-        {
-            return (false, "Invalid client credentials", null);
-        }
-
-        var principal = _tokenService.ValidateToken(request.AccessToken);
-        if (principal == null)
-        {
-            return (false, "Invalid access token", null);
-        }
-
-        var userId = principal.FindFirstValue(ClaimTypes.NameIdentifier);
-        if (string.IsNullOrEmpty(userId))
-        {
-            return (false, "Invalid token claims", null);
-        }
-
-        var isValidRefreshToken = await _tokenService.ValidateRefreshToken(userId, request.ClientType, request.RefreshToken);
-        if (!isValidRefreshToken)
-        {
-            return (false, "Invalid refresh token", null);
-        }
-
-        var user = await _userManager.FindByIdAsync(userId);
-        if (user == null)
-        {
-            return (false, "User not found", null);
-        }
-
-        var authResult = await GenerateAuthenticationResultAsync(user, request.ClientType);
-        return (true, null, authResult);
     }
 
     public async Task<(bool success, string? error, AuthenticationResult? result)> HandleExternalLoginAsync(
@@ -196,25 +139,62 @@ public class AccountService
         return (false, string.Join(", ", result.Errors.Select(e => e.Description)));
     }
 
-    public async Task<IEnumerable<string>> GetUserSessionsAsync(string userId)
-    {
-        return await _sessionService.GetUserActiveSessions(userId);
+    public async Task<List<UserSession>> GetUserSessionsAsync(string userId)
+    {   
+        var authorizations = await _sessionService.GetActiveSessionsAsync(userId);
+        var sessions = new List<UserSession>();
+
+        foreach (var authorization in authorizations)
+        {
+            var clientId = await _authorizationManager.GetApplicationIdAsync(authorization);
+            if (clientId != null)
+            {
+                var application = await _applicationManager.FindByIdAsync(clientId);
+                if (application != null)
+                {
+                    sessions.Add(new UserSession
+                    {
+                        Id = await _authorizationManager.GetIdAsync(authorization),
+                        ClientId = await _applicationManager.GetClientIdAsync(application),
+                        CreatedAt = await _authorizationManager.GetCreationDateAsync(authorization) ?? DateTime.UtcNow,
+                        Scopes = await _authorizationManager.GetScopesAsync(authorization)
+                    });
+                }
+            }
+        }
+
+        return sessions;
     }
 
-    public async Task RevokeSessionAsync(string userId, string clientType)
+    public async Task RevokeSessionAsync(string userId, string clientId)
     {
-        await _tokenService.RevokeRefreshToken(userId, clientType);
+        var authorizations = await _sessionService.GetActiveSessionsAsync(userId);
+        
+        foreach (var authorization in authorizations)
+        {
+            var authClientId = await _authorizationManager.GetApplicationIdAsync(authorization);
+            var application = await _applicationManager.FindByIdAsync(authClientId);
+            
+            if (application != null && await _applicationManager.GetClientIdAsync(application) == clientId)
+            {
+                await _sessionService.RevokeSessionAsync(await _authorizationManager.GetIdAsync(authorization));
+            }
+        }
     }
 
     public async Task RevokeAllSessionsAsync(string userId)
     {
-        await _tokenService.RevokeAllRefreshTokens(userId);
+        await _sessionService.RevokeAllSessionsAsync(userId);
     }
 
-    public async Task LogoutAsync(string userId, string clientType)
+    public async Task LogoutAsync(string userId, string clientId)
     {
-        await _tokenService.RevokeRefreshToken(userId, clientType);
-        await _signInManager.SignOutAsync();
+        await RevokeSessionAsync(userId, clientId);
+    }
+
+    public async Task<object> CreateAuthorizationAsync(string userId, string clientId, string[] scopes)
+    {
+        return await _sessionService.CreateSessionAsync(userId, clientId, scopes);
     }
 
     public async Task<IEnumerable<string>> GetResourcesAsync(IEnumerable<string> scopes)
@@ -225,41 +205,5 @@ public class AccountService
             resources.Add(resource);
         }
         return resources;
-    }
-
-    public async Task<object> CreateAuthorizationAsync(ApplicationUser user, string? clientId, IEnumerable<string> scopes)
-    {
-        var application = await _applicationManager.FindByClientIdAsync(clientId);
-        if (application == null)
-        {
-            throw new InvalidOperationException("The application cannot be found.");
-        }
-
-        var applicationId = await _applicationManager.GetIdAsync(application);
-        var userId = await _userManager.GetUserIdAsync(user);
-
-        var authorizations = new List<object>();
-        await foreach (var a in _authorizationManager.FindAsync(
-            subject: userId,
-            client: applicationId,
-            status: OpenIddictConstants.Statuses.Valid,
-            type: OpenIddictConstants.AuthorizationTypes.Permanent,
-            scopes: scopes.ToImmutableArray()))
-        {
-            authorizations.Add(a);
-        }
-
-        var authorization = authorizations.FirstOrDefault();
-        if (authorization == null)
-        {
-            authorization = await _authorizationManager.CreateAsync(
-                principal: new ClaimsPrincipal(new ClaimsIdentity()),
-                subject: userId,
-                client: applicationId,
-                type: OpenIddictConstants.AuthorizationTypes.Permanent,
-                scopes: scopes.ToImmutableArray());
-        }
-
-        return authorization;
     }
 }

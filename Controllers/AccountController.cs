@@ -8,8 +8,12 @@ using System.Security.Claims;
 
 namespace OAuthServer.Controllers;
 
+/// <summary>
+/// Controller for managing user accounts and session management
+/// </summary>
 [ApiController]
 [Route("[controller]")]
+[Produces("application/json")]
 public class AccountController : ControllerBase
 {
     private readonly AccountService _accountService;
@@ -26,46 +30,22 @@ public class AccountController : ControllerBase
         _userManager = userManager;
     }
 
-    [HttpPost("token")]
-    public async Task<IActionResult> GetToken([FromBody] TokenRequest request)
-    {
-        try
-        {
-            var (success, error, result) = await _accountService.AuthenticateAsync(request);
-            if (!success)
-            {
-                return Unauthorized(error);
-            }
-
-            return Ok(result);
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"An error occurred while processing your request: {ex.Message}");
-        }
-    }
-
-    [HttpPost("refresh-token")]
-    public async Task<IActionResult> RefreshToken([FromBody] RefreshTokenRequest request)
-    {
-        try
-        {
-            var (success, error, result) = await _accountService.RefreshTokenAsync(request);
-            if (!success)
-            {
-                return BadRequest(error);
-            }
-
-            return Ok(result);
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, $"An error occurred while processing your request: {ex.Message}");
-        }
-    }
-
+    /// <summary>
+    /// Retrieves all active sessions for the authenticated user
+    /// </summary>
+    /// <remarks>
+    /// Requires authentication. Returns a list of all active sessions across different client types.
+    /// </remarks>
+    /// <response code="200">Returns the list of active sessions</response>
+    /// <response code="400">If the token claims are invalid</response>
+    /// <response code="401">If the user is not authenticated</response>
+    /// <response code="500">If there was an internal server error</response>
     [HttpGet("sessions")]
     [Authorize]
+    [ProducesResponseType(typeof(IEnumerable<string>), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> GetActiveSessions()
     {
         try
@@ -75,7 +55,7 @@ public class AccountController : ControllerBase
             {
                 return BadRequest("Invalid token claims");
             }
-
+            
             var sessions = await _accountService.GetUserSessionsAsync(userId);
             return Ok(sessions);
         }
@@ -85,8 +65,23 @@ public class AccountController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Revokes a specific session for the authenticated user
+    /// </summary>
+    /// <param name="clientType">The type of client (e.g., 'web', 'mobile')</param>
+    /// <remarks>
+    /// Requires authentication. Revokes all tokens associated with the specified client type.
+    /// </remarks>
+    /// <response code="200">If the session was successfully revoked</response>
+    /// <response code="400">If the token claims are invalid</response>
+    /// <response code="401">If the user is not authenticated</response>
+    /// <response code="500">If there was an internal server error</response>
     [HttpPost("revoke")]
     [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> RevokeSession(string clientType)
     {
         try
@@ -106,8 +101,22 @@ public class AccountController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Revokes all active sessions for the authenticated user
+    /// </summary>
+    /// <remarks>
+    /// Requires authentication. Revokes all tokens across all client types.
+    /// </remarks>
+    /// <response code="200">If all sessions were successfully revoked</response>
+    /// <response code="400">If the token claims are invalid</response>
+    /// <response code="401">If the user is not authenticated</response>
+    /// <response code="500">If there was an internal server error</response>
     [HttpPost("revoke-all")]
     [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> RevokeAllSessions()
     {
         try
@@ -127,7 +136,20 @@ public class AccountController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Initiates external authentication with the specified provider
+    /// </summary>
+    /// <param name="provider">The authentication provider (e.g., 'Google', 'Facebook')</param>
+    /// <param name="clientType">The type of client application</param>
+    /// <param name="returnUrl">Optional URL to redirect after successful authentication</param>
+    /// <remarks>
+    /// Redirects to the external provider's authentication page.
+    /// </remarks>
+    /// <response code="302">Redirects to the external provider</response>
+    /// <response code="400">If the redirect URL could not be generated</response>
     [HttpGet("login/{provider}")]
+    [ProducesResponseType(StatusCodes.Status302Found)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
     public IActionResult ExternalLogin(
         string provider,
         string clientType,
@@ -147,7 +169,25 @@ public class AccountController : ControllerBase
         return Challenge(properties, provider);
     }
 
+    /// <summary>
+    /// Handles the callback from external authentication providers
+    /// </summary>
+    /// <param name="returnUrl">Optional URL to redirect after successful authentication</param>
+    /// <param name="clientType">The type of client application</param>
+    /// <remarks>
+    /// This endpoint is called by the external provider after successful authentication.
+    /// If a returnUrl is provided, redirects there with tokens as query parameters.
+    /// Otherwise, returns the tokens in the response body.
+    /// </remarks>
+    /// <response code="200">Returns the authentication result</response>
+    /// <response code="302">Redirects to returnUrl with tokens if provided</response>
+    /// <response code="400">If the external login information is invalid</response>
+    /// <response code="500">If there was an internal server error</response>
     [HttpGet("callback")]
+    [ProducesResponseType(typeof(AuthenticationResult), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status302Found)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> ExternalLoginCallback(string? returnUrl = null, string clientType = "platform_web")
     {
         try
@@ -197,9 +237,21 @@ public class AccountController : ControllerBase
         return Redirect(uriBuilder.ToString());
     }
 
+    /// <summary>
+    /// Logs out the currently authenticated user
+    /// </summary>
+    /// <remarks>
+    /// Requires authentication. Revokes the current session's tokens.
+    /// </remarks>
+    /// <response code="200">If the logout was successful</response>
+    /// <response code="401">If the user is not authenticated</response>
+    /// <response code="500">If there was an internal server error</response>
     [Authorize]
     [HttpPost("logout")]
-    public async Task<IActionResult> Logout(string clientType)
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
+    public async Task<IActionResult> Logout()
     {
         try
         {
@@ -209,7 +261,7 @@ public class AccountController : ControllerBase
                 return BadRequest("Invalid token claims");
             }
 
-            await _accountService.LogoutAsync(userId, clientType);
+            await _accountService.LogoutAsync(userId, "platform_web");
             return Ok();
         }
         catch (Exception ex)
@@ -218,7 +270,27 @@ public class AccountController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Registers a new user
+    /// </summary>
+    /// <param name="request">The registration request containing user information</param>
+    /// <remarks>
+    /// Sample request:
+    ///
+    ///     POST /Account/register
+    ///     {
+    ///        "email": "user@example.com",
+    ///        "password": "user_password",
+    ///        "username": "user_username"
+    ///     }
+    /// </remarks>
+    /// <response code="200">If the registration was successful</response>
+    /// <response code="400">If the registration request is invalid</response>
+    /// <response code="500">If there was an internal server error</response>
     [HttpPost("register")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<IActionResult> Register([FromBody] RegistrationRequest request)
     {
         try
@@ -237,8 +309,22 @@ public class AccountController : ControllerBase
         }
     }
 
+    /// <summary>
+    /// Retrieves information about the currently authenticated user
+    /// </summary>
+    /// <remarks>
+    /// Requires authentication. Returns user information, including roles.
+    /// </remarks>
+    /// <response code="200">Returns the user information</response>
+    /// <response code="401">If the user is not authenticated</response>
+    /// <response code="404">If the user is not found</response>
+    /// <response code="500">If there was an internal server error</response>
     [Authorize]
     [HttpGet("me")]
+    [ProducesResponseType(typeof(UserInfoResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status401Unauthorized)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    [ProducesResponseType(StatusCodes.Status500InternalServerError)]
     public async Task<ActionResult<UserInfoResponse>> GetUserInfo()
     {
         try
@@ -272,5 +358,9 @@ public class AccountController : ControllerBase
         {
             return StatusCode(500, new { error = $"An error occurred while retrieving user information: {ex.Message}" });
         }
+    }
+    public IActionResult Login(string? returnurl)
+    {
+        throw new NotImplementedException();
     }
 }

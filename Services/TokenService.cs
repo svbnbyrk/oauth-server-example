@@ -5,22 +5,28 @@ using System.Text;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
 using OAuthServer.Models;
+using OAuthServer.Models.OAuth;
+using OAuthServer.Services.Interfaces;
+using OpenIddict.Abstractions;
 
 namespace OAuthServer.Services;
 
-public class TokenService
+public class TokenService : ITokenService
 {
     private readonly TokenConfiguration _configuration;
     private readonly UserManager<ApplicationUser> _userManager;
-    private readonly SessionService _sessionService;
+    private readonly SignInManager<ApplicationUser> _signInManager;
+    private readonly ISessionService _sessionService;
 
     public TokenService(
         TokenConfiguration configuration,
         UserManager<ApplicationUser> userManager,
-        SessionService sessionService)
+        SignInManager<ApplicationUser> signInManager,
+        ISessionService sessionService)
     {
         _configuration = configuration;
         _userManager = userManager;
+        _signInManager = signInManager;
         _sessionService = sessionService;
     }
 
@@ -115,18 +121,63 @@ public class TokenService
         return settings.ClientId == clientId && settings.ClientSecret == clientSecret;
     }
 
-    public async Task<bool> ValidateRefreshToken(string userId, string clientType, string refreshToken)
+    public async Task<TokenResponse> HandlePasswordGrantType(string username, string password, string clientId)
     {
-        return await _sessionService.ValidateRefreshToken(userId, clientType, refreshToken);
+        var user = await _userManager.FindByNameAsync(username);
+        if (user == null)
+        {
+            throw new InvalidGrantException("The username/password couple is invalid.");
+        }
+
+        var result = await _signInManager.CheckPasswordSignInAsync(user, password, lockoutOnFailure: true);
+        if (!result.Succeeded)
+        {
+            throw new InvalidGrantException("The username/password couple is invalid.");
+        }
+
+        var (accessToken, refreshToken) = await GenerateTokens(user, clientId);
+
+        return CreateTokenResponse(accessToken, refreshToken, user.Scopes);
     }
 
-    public async Task RevokeRefreshToken(string userId, string clientType)
+    public async Task<TokenResponse> HandleRefreshTokenGrantType(ClaimsPrincipal principal, string clientId)
     {
-        await _sessionService.RemoveUserSession(userId, clientType);
+        var userId = principal.FindFirstValue(OpenIddictConstants.Claims.Subject);
+        if (string.IsNullOrEmpty(userId))
+        {
+            throw new InvalidGrantException("The refresh token is no longer valid.");
+        }
+
+        var user = await _userManager.FindByIdAsync(userId);
+        if (user == null)
+        {
+            throw new InvalidGrantException("The refresh token is no longer valid.");
+        }
+
+        if (!await _signInManager.CanSignInAsync(user))
+        {
+            throw new InvalidGrantException("The user is no longer allowed to sign in.");
+        }
+
+        var (accessToken, refreshToken) = await GenerateTokens(user, clientId);
+
+        return CreateTokenResponse(accessToken, refreshToken, principal.GetScopes());
     }
 
-    public async Task RevokeAllRefreshTokens(string userId)
+    private TokenResponse CreateTokenResponse(string accessToken, string refreshToken, IEnumerable<string> scopes)
     {
-        await _sessionService.RemoveAllUserSessions(userId);
+        return new TokenResponse
+        {
+            AccessToken = accessToken,
+            TokenType = "Bearer",
+            ExpiresIn = 1800, // 30 minutes
+            RefreshToken = refreshToken,
+            Scope = string.Join(" ", scopes)
+        };
+    }
+
+    public class InvalidGrantException : Exception
+    {
+        public InvalidGrantException(string message) : base(message) { }
     }
 }

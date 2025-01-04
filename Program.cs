@@ -7,9 +7,9 @@ using OpenIddict.Abstractions;
 using OAuthServer.Data;
 using OAuthServer.Models;
 using OAuthServer.Services;
-using StackExchange.Redis;
 using static OpenIddict.Abstractions.OpenIddictConstants;
 using Microsoft.AspNetCore.Mvc.Controllers;
+using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -27,8 +27,6 @@ builder.Services.AddIdentity<ApplicationUser, IdentityRole>()
 
 // Configure Redis
 var redisConfiguration = builder.Configuration.GetSection("Redis").Get<string>();
-var redis = ConnectionMultiplexer.Connect(redisConfiguration ?? "localhost:6379");
-builder.Services.AddSingleton<IConnectionMultiplexer>(redis);
 
 // Configure token settings
 var tokenConfig = builder.Configuration.GetSection("TokenConfiguration").Get<TokenConfiguration>();
@@ -42,6 +40,15 @@ builder.Services.AddSingleton(tokenConfig);
 builder.Services.AddScoped<TokenService>();
 builder.Services.AddScoped<SessionService>();
 builder.Services.AddScoped<AccountService>();
+
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = builder.Configuration.GetConnectionString("Redis");
+});
+
+builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
+    ConnectionMultiplexer.Connect(builder.Configuration.GetConnectionString("Redis")));
+builder.Services.AddScoped<IRedisSessionStore, RedisSessionStore>();
 
 builder.Services.AddOpenIddict()
     .AddCore(options =>
@@ -72,6 +79,20 @@ builder.Services.AddOpenIddict()
     });
 
 builder.Services.AddAuthentication()
+    .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(tokenConfig.SecretKey)),
+            ValidateIssuer = true,
+            ValidIssuer = tokenConfig.Issuer,
+            ValidateAudience = true,
+            ValidAudience = tokenConfig.Audience,
+            ValidateLifetime = true,
+            ClockSkew = TimeSpan.Zero
+        };
+    })
     .AddGoogle(options =>
     {
         var googleAuthSection = builder.Configuration.GetSection("Authentication:Google");

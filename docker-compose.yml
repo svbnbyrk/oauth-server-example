@@ -21,8 +21,34 @@ services:
     depends_on:
       - redis
 
+  postgres:
+    image: postgres:latest
+    environment:
+      POSTGRES_DB: oauth_server
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - oauth_network
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    networks:
+      - oauth_network
+    depends_on:
+      - postgres
+
 volumes:
   redis_data:
+  postgres_data:
 
 networks:
   oauth_network:

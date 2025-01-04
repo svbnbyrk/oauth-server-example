@@ -1,117 +1,163 @@
-using StackExchange.Redis;
-using System.Text.Json;
 using Microsoft.AspNetCore.Identity;
+using OAuthServer.Services.Interfaces;
+using OpenIddict.Abstractions;
+using System.Security.Claims;
 using OAuthServer.Models;
+using System.Collections.Immutable;
 
 namespace OAuthServer.Services;
 
-public class SessionService
+public class SessionService : ISessionService
 {
-    private readonly IConnectionMultiplexer _redis;
+    private readonly IOpenIddictAuthorizationManager _authorizationManager;
+    private readonly IOpenIddictApplicationManager _applicationManager;
     private readonly UserManager<ApplicationUser> _userManager;
-    private readonly IDatabase _db;
+    private readonly IRedisSessionStore _redisSessionStore;
 
-    public SessionService(IConnectionMultiplexer redis, UserManager<ApplicationUser> userManager)
+    public SessionService(
+        IOpenIddictAuthorizationManager authorizationManager,
+        IOpenIddictApplicationManager applicationManager,
+        UserManager<ApplicationUser> userManager,
+        IRedisSessionStore redisSessionStore)
     {
-        _redis = redis;
+        _authorizationManager = authorizationManager;
+        _applicationManager = applicationManager;
         _userManager = userManager;
-        _db = redis.GetDatabase();
+        _redisSessionStore = redisSessionStore;
     }
 
-    public async Task StoreUserSession(string userId, string clientType, string refreshToken, DateTime expiryTime)
+    public async Task<object> CreateSessionAsync(string userId, string clientId, ImmutableArray<string> scopes)
     {
-        var sessionInfo = new UserSessionInfo
+        // Get or create the application
+        var application = await _applicationManager.FindByClientIdAsync(clientId) ??
+            throw new InvalidOperationException("The application cannot be found.");
+
+        // Create a new authorization
+        var authorization = await _authorizationManager.CreateAsync(
+            principal: new ClaimsPrincipal(new ClaimsIdentity()),
+            subject: userId,
+            client: await _applicationManager.GetIdAsync(application),
+            type: OpenIddictConstants.AuthorizationTypes.Permanent,
+            scopes: scopes);
+
+        var session = new UserSession
         {
+            Id = await _authorizationManager.GetIdAsync(authorization),
             UserId = userId,
-            ClientType = clientType,
-            RefreshToken = refreshToken,
-            ExpiryTime = expiryTime,
-            CreatedAt = DateTime.UtcNow
+            ClientId = clientId,
+            CreatedAt = DateTimeOffset.UtcNow,
+            Scopes = scopes
         };
 
-        var key = GetSessionKey(userId, clientType);
-        await _db.HashSetAsync(key, new HashEntry[]
+        await _redisSessionStore.StoreSessionAsync(session.Id, session, TimeSpan.FromDays(30));
+        
+        return authorization;
+    }
+
+    public async Task<object> GetSessionAsync(string authorizationId)
+    {
+        return await _authorizationManager.FindByIdAsync(authorizationId);
+    }
+
+    public async Task<List<object>> GetActiveSessionsAsync(string userId)
+    {
+        var sessions = await _redisSessionStore.GetUserSessionsAsync(userId);
+        var authorizations = new List<object>();
+
+        foreach (var session in sessions)
         {
-            new HashEntry("refreshToken", refreshToken),
-            new HashEntry("expiryTime", expiryTime.ToString("O")),
-            new HashEntry("createdAt", DateTime.UtcNow.ToString("O"))
-        });
+            var authorization = await _authorizationManager.FindByIdAsync(session.Id);
+            if (authorization != null)
+            {
+                authorizations.Add(authorization);
+            }
+            else
+            {
+                // Clean up Redis if authorization no longer exists
+                await _redisSessionStore.RemoveSessionAsync(session.Id);
+            }
+        }
 
-        // Set key expiration to match token expiry
-        await _db.KeyExpireAsync(key, expiryTime);
-
-        // Store session in user's active sessions set
-        await _db.SetAddAsync($"user:{userId}:sessions", clientType);
+        return authorizations;
     }
 
-    public async Task<UserSessionInfo?> GetUserSession(string userId, string clientType)
+    public async Task<List<object>> GetActiveSessionsAsync(string userId, string clientId)
     {
-        var key = GetSessionKey(userId, clientType);
-        var hashEntries = await _db.HashGetAllAsync(key);
+        var sessions = await _redisSessionStore.GetUserSessionsAsync(userId);
+        var authorizations = new List<object>();
 
-        if (hashEntries.Length == 0)
-            return null;
-
-        var sessionInfo = new UserSessionInfo
+        foreach (var session in sessions)
         {
-            UserId = userId,
-            ClientType = clientType,
-            RefreshToken = hashEntries.First(h => h.Name == "refreshToken").Value,
-            ExpiryTime = DateTime.Parse(hashEntries.First(h => h.Name == "expiryTime").Value),
-            CreatedAt = DateTime.Parse(hashEntries.First(h => h.Name == "createdAt").Value)
-        };
+            if (session.ClientId == clientId)
+            {
+                var authorization = await _authorizationManager.FindByIdAsync(session.Id);
+                if (authorization != null)
+                {
+                    authorizations.Add(authorization);
+                }
+                else
+                {
+                    // Clean up Redis if authorization no longer exists
+                    await _redisSessionStore.RemoveSessionAsync(session.Id);
+                }
+            }
+        }
 
-        return sessionInfo;
+        return authorizations;
     }
 
-    public async Task<IEnumerable<string>> GetUserActiveSessions(string userId)
+    public async Task RevokeSessionAsync(string? authorizationId)
     {
-        var sessions = await _db.SetMembersAsync($"user:{userId}:sessions");
-        return sessions.Select(s => s.ToString());
-    }
-
-    public async Task RemoveUserSession(string userId, string clientType)
-    {
-        var key = GetSessionKey(userId, clientType);
-        await _db.KeyDeleteAsync(key);
-        await _db.SetRemoveAsync($"user:{userId}:sessions", clientType);
-    }
-
-    public async Task RemoveAllUserSessions(string userId)
-    {
-        var sessions = await GetUserActiveSessions(userId);
-        foreach (var clientType in sessions)
+        var authorization = await _authorizationManager.FindByIdAsync(authorizationId);
+        if (authorization != null)
         {
-            await RemoveUserSession(userId, clientType);
+            await _authorizationManager.TryRevokeAsync(authorization);
         }
     }
 
-    public async Task<bool> ValidateRefreshToken(string userId, string clientType, string refreshToken)
+    public async Task RevokeAllSessionsAsync(string userId)
     {
-        var session = await GetUserSession(userId, clientType);
-        if (session == null)
+        var sessions = await _redisSessionStore.GetUserSessionsAsync(userId);
+        foreach (var session in sessions)
+        {
+            var authorization = await _authorizationManager.FindByIdAsync(session.Id);
+            if (authorization != null)
+            {
+                await _authorizationManager.TryRevokeAsync(authorization);
+            }
+            await _redisSessionStore.RemoveSessionAsync(session.Id);
+        }
+    }
+
+    public async Task<bool> ValidateSessionAsync(string authorizationId, string clientId)
+    {
+        if (string.IsNullOrEmpty(authorizationId) || string.IsNullOrEmpty(clientId))
+        {
             return false;
+        }
 
-        return session.RefreshToken == refreshToken && session.ExpiryTime > DateTime.UtcNow;
+        var authorization = await _authorizationManager.FindByIdAsync(authorizationId);
+        if (authorization == null)
+        {
+            return false;
+        }
+
+        var application = await _applicationManager.FindByClientIdAsync(clientId);
+        if (application == null)
+        {
+            return false;
+        }
+
+        var validationResult = _authorizationManager.ValidateAsync(authorization);
+        if (validationResult != null)
+        {
+            return false;
+        }
+
+        // Check if the authorization belongs to the specified client
+        var authorizationClientId = await _authorizationManager.GetApplicationIdAsync(authorization);
+        var applicationId = await _applicationManager.GetIdAsync(application);
+
+        return authorizationClientId == applicationId;
     }
-
-    public async Task<IEnumerable<string>> GetUserRoles(string userId)
-    {
-        var user = await _userManager.FindByIdAsync(userId);
-        if (user == null)
-            return Enumerable.Empty<string>();
-
-        return await _userManager.GetRolesAsync(user);
-    }
-
-    private static string GetSessionKey(string userId, string clientType) => $"session:{userId}:{clientType}";
-}
-
-public class UserSessionInfo
-{
-    public required string UserId { get; set; }
-    public required string ClientType { get; set; }
-    public required string RefreshToken { get; set; }
-    public DateTime ExpiryTime { get; set; }
-    public DateTime CreatedAt { get; set; }
 }
