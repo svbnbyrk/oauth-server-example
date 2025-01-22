@@ -70,7 +70,7 @@ public class TokenService : ITokenService
         var refreshTokenExpiryTime = DateTime.UtcNow.AddDays(clientSettings.RefreshTokenLifetimeDays);
 
         // Store session in Redis
-        await _sessionService.StoreUserSession(user.Id, clientType, refreshToken, refreshTokenExpiryTime);
+        //await _sessionService.StoreUserSession(user.Id, clientType, refreshToken, refreshTokenExpiryTime);
         
         return (new JwtSecurityTokenHandler().WriteToken(accessToken), refreshToken);
     }

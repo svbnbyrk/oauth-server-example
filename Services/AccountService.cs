@@ -194,13 +194,13 @@ public class AccountService : IAccountService
 
     public async Task<object> CreateAuthorizationAsync(string userId, string clientId, string[] scopes)
     {
-        return await _sessionService.CreateSessionAsync(userId, clientId, scopes);
+        return await _sessionService.CreateSessionAsync(userId, clientId, scopes.ToImmutableArray());
     }
 
     public async Task<IEnumerable<string>> GetResourcesAsync(IEnumerable<string> scopes)
     {
         var resources = new List<string>();
-        await foreach (var resource in _scopeManager.ListResourcesAsync((ImmutableArray<string>)scopes))
+        await foreach (var resource in _scopeManager.ListResourcesAsync(scopes.ToImmutableArray()))
         {
             resources.Add(resource);
         }

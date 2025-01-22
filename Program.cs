@@ -4,12 +4,17 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
 using System.Text;
 using OpenIddict.Abstractions;
+using OAuthServer.Services.Interfaces;
 using OAuthServer.Data;
 using OAuthServer.Models;
 using OAuthServer.Services;
 using static OpenIddict.Abstractions.OpenIddictConstants;
 using Microsoft.AspNetCore.Mvc.Controllers;
 using StackExchange.Redis;
+using Microsoft.AspNetCore.HttpOverrides;
+using System.Net;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.Google;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -24,7 +29,7 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
 builder.Services.AddIdentity<ApplicationUser, IdentityRole>()
     .AddEntityFrameworkStores<ApplicationDbContext>()
     .AddDefaultTokenProviders();
-
+    
 // Configure Redis
 var redisConfiguration = builder.Configuration.GetSection("Redis").Get<string>();
 
@@ -37,13 +42,19 @@ if (tokenConfig == null)
 builder.Services.AddSingleton(tokenConfig);
 
 // Register services
-builder.Services.AddScoped<TokenService>();
-builder.Services.AddScoped<SessionService>();
-builder.Services.AddScoped<AccountService>();
+builder.Services.AddScoped<IIdentityClientRoleService, IdentityClientRoleService>();
+builder.Services.AddScoped<ITokenService, TokenService>();
+builder.Services.AddScoped<ISessionService, SessionService>();
+builder.Services.AddScoped<IAccountService, AccountService>();
 
 builder.Services.AddStackExchangeRedisCache(options =>
 {
     options.Configuration = builder.Configuration.GetConnectionString("Redis");
+});
+
+builder.Services.Configure<CookiePolicyOptions>(options =>
+{
+    options.MinimumSameSitePolicy = SameSiteMode.Lax; // Allows cookies during cross-origin authentication
 });
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
@@ -78,6 +89,21 @@ builder.Services.AddOpenIddict()
         options.UseAspNetCore();
     });
 
+// Configure forwarded headers
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    // Clear default networks first
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+    // Add local development network
+    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("::ffff:172.16.1.0"), 120));
+    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("172.16.1.0"), 24));
+    // Add localhost
+    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("::ffff:127.0.0.1"), 120));
+    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("127.0.0.1"), 32));
+});
+
 builder.Services.AddAuthentication()
     .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
     {
@@ -98,6 +124,29 @@ builder.Services.AddAuthentication()
         var googleAuthSection = builder.Configuration.GetSection("Authentication:Google");
         options.ClientId = googleAuthSection["ClientId"] ?? throw new InvalidOperationException("Google ClientId is missing in configuration");
         options.ClientSecret = googleAuthSection["ClientSecret"] ?? throw new InvalidOperationException("Google ClientSecret is missing in configuration");
+
+        options.Scope.Add("profile");
+        options.Scope.Add("email");
+
+        options.CallbackPath = "/account/callback";
+        options.SaveTokens = true;
+
+        options.Events = new Microsoft.AspNetCore.Authentication.OAuth.OAuthEvents
+        {
+            OnTicketReceived = context =>
+            {
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+                logger.LogInformation("Authentication ticket received successfully");
+                return Task.CompletedTask;
+            },
+
+            OnRemoteFailure = context =>
+            {
+                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+                logger.LogError($"Remote authentication failed: {context.Failure?.Message}");
+                return Task.CompletedTask;
+            }
+        };
     })
     .AddFacebook(options =>
     {
@@ -105,6 +154,18 @@ builder.Services.AddAuthentication()
         options.AppId = facebookAuthSection["AppId"] ?? throw new InvalidOperationException("Facebook AppId is missing in configuration");
         options.AppSecret = facebookAuthSection["AppSecret"] ?? throw new InvalidOperationException("Facebook AppSecret is missing in configuration");
     });
+
+// Configure CORS
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.WithOrigins("http://localhost:5250", "https://localhost:5251", "http://localhost:62128") // Add your client application URLs here
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
@@ -166,8 +227,8 @@ builder.Services.AddSwaggerGen(options =>
 // Configure Kestrel to allow HTTP and HTTPS
 builder.WebHost.ConfigureKestrel(options =>
 {
-    options.ListenAnyIP(5002); // HTTP port
-    options.ListenAnyIP(5003, listenOptions =>
+    options.ListenAnyIP(5250); // HTTP port
+    options.ListenAnyIP(5251, listenOptions =>
     {
         listenOptions.UseHttps(); // HTTPS port
     });
@@ -183,11 +244,26 @@ if (app.Environment.IsDevelopment())
     app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "OAuth Server API v1"));
 }
 
+// Add forwarded headers middleware early in the pipeline
+app.UseForwardedHeaders();
+
 // Enable HTTPS redirection
 app.UseHttpsRedirection();
 
+app.UseRouting();
+
+app.UseCors();
+
 app.UseAuthentication();
+
 app.UseAuthorization();
+
+app.UseForwardedHeaders(new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedProto
+});
+
+app.UseCookiePolicy();
 
 app.MapControllers();
 

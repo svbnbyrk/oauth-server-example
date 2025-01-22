@@ -18,17 +18,20 @@ public class AuthorizationService : IAuthorizationService
     private readonly UserManager<ApplicationUser> _userManager;
     private readonly IOpenIddictApplicationManager _applicationManager;
     private readonly IOpenIddictAuthorizationManager _authorizationManager;
+    private readonly IOpenIddictTokenManager _tokenManager;
     private readonly IAccountService _accountService;
 
     public AuthorizationService(
         UserManager<ApplicationUser> userManager,
         IOpenIddictApplicationManager applicationManager,
         IOpenIddictAuthorizationManager authorizationManager,
+        IOpenIddictTokenManager tokenManager,
         IAccountService accountService)
     {
         _userManager = userManager;
         _applicationManager = applicationManager;
         _authorizationManager = authorizationManager;
+        _tokenManager = tokenManager;
         _accountService = accountService;
     }
 
@@ -76,12 +79,18 @@ public class AuthorizationService : IAuthorizationService
                 request.Scope?.Split(' ') ?? Array.Empty<string>());
 
             // Generate the authorization code
-            var code = await _authorizationManager.CreateAuthorizationCodeAsync(authorization);
+            var code = await _tokenManager.CreateAsync(new OpenIddictTokenDescriptor
+            {
+                AuthorizationId = await _authorizationManager.GetIdAsync(authorization),
+                Status = OpenIddictConstants.Statuses.Valid,
+                Subject = userId,
+                Type = OpenIddictConstants.ResponseTypes.Code
+            });
 
             // Build the redirect URI
             var location = QueryHelpers.AddQueryString(request.RedirectUri, new Dictionary<string, string?>
             {
-                ["code"] = code,
+                ["code"] = code.ToString(),
                 ["state"] = request.State
             });
 

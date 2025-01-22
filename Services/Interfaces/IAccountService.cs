@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Microsoft.AspNetCore.Identity;
 using OAuthServer.Models;
 using OpenIddict.Abstractions;
@@ -12,4 +13,5 @@ public interface IAccountService
     Task RevokeAllSessionsAsync(string userId);
     Task LogoutAsync(string userId, string clientType);
     Task<object> CreateAuthorizationAsync(string userId, string clientId, string[] scopes);
+    Task<(bool success, string? error, AuthenticationResult? result)> HandleExternalLoginAsync(ExternalLoginInfo info,string clientType);
 }

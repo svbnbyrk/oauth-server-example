@@ -13,17 +13,20 @@ public class SessionService : ISessionService
     private readonly IOpenIddictApplicationManager _applicationManager;
     private readonly UserManager<ApplicationUser> _userManager;
     private readonly IRedisSessionStore _redisSessionStore;
+    private readonly IIdentityClientRoleService _clientRoleService;
 
     public SessionService(
         IOpenIddictAuthorizationManager authorizationManager,
         IOpenIddictApplicationManager applicationManager,
         UserManager<ApplicationUser> userManager,
-        IRedisSessionStore redisSessionStore)
+        IRedisSessionStore redisSessionStore,
+        IIdentityClientRoleService clientRoleService)
     {
         _authorizationManager = authorizationManager;
         _applicationManager = applicationManager;
         _userManager = userManager;
         _redisSessionStore = redisSessionStore;
+        _clientRoleService = clientRoleService;
     }
 
     public async Task<object> CreateSessionAsync(string userId, string clientId, ImmutableArray<string> scopes)
@@ -32,9 +35,12 @@ public class SessionService : ISessionService
         var application = await _applicationManager.FindByClientIdAsync(clientId) ??
             throw new InvalidOperationException("The application cannot be found.");
 
+        // Get client-specific identity with roles
+        var identity = await _clientRoleService.GetUserClaimsIdentityAsync(userId, clientId);
+
         // Create a new authorization
         var authorization = await _authorizationManager.CreateAsync(
-            principal: new ClaimsPrincipal(new ClaimsIdentity()),
+            principal: new ClaimsPrincipal(identity),
             subject: userId,
             client: await _applicationManager.GetIdAsync(application),
             type: OpenIddictConstants.AuthorizationTypes.Permanent,
