@@ -7,6 +7,7 @@ using OAuthServer.Services;
 using OAuthServer.Services.Interfaces;
 using System.Security.Claims;
 using Microsoft.Extensions.Logging;
+using System.Web;
 
 namespace OAuthServer.Controllers;
 
@@ -160,34 +161,28 @@ public class AccountController : ControllerBase
         string clientType,
         string? returnUrl = null)
     {
-        _logger.LogInformation($"Starting external login for provider: {provider}, returnUrl: {returnUrl}");
+        _logger.LogInformation($"Starting external login for provider: {provider}, clientType: {clientType}, returnUrl: {returnUrl}");
 
-        // Ensure we have a return URL
         if (string.IsNullOrEmpty(returnUrl))
         {
-            returnUrl = "https://localhost:5251";
+            returnUrl = "http://localhost:3000/auth/callback"; // Your SPA callback URL
         }
 
-        var redirectUrl = Url.Action(
-            nameof(ExternalLoginCallback),
-            "Account",
-            new { returnUrl, clientType },
-            Request.Scheme,
-            Request.Host.Value);
-
-        if (string.IsNullOrEmpty(redirectUrl))
+        var properties = new AuthenticationProperties
         {
-            _logger.LogError("Failed to generate redirect URL");
-            return BadRequest("Unable to generate redirect URL");
-        }
+            RedirectUri = Url.Action(
+                nameof(ExternalLoginCallback),
+                "Account",
+                new { returnUrl, clientType },
+                Request.Scheme,
+                Request.Host.Value),
+            Items =
+            {
+                { "returnUrl", returnUrl },
+                { "clientType", clientType }
+            }
+        };
 
-        _logger.LogInformation($"Generated redirect URL: {redirectUrl}");
-
-        var properties = _signInManager.ConfigureExternalAuthenticationProperties(provider, redirectUrl);
-        
-        // Store the return URL in the properties
-        properties.Items["returnUrl"] = returnUrl;
-        
         _logger.LogInformation($"Challenging with provider: {provider}");
         return Challenge(properties, provider);
     }
@@ -215,36 +210,80 @@ public class AccountController : ControllerBase
     {
         try
         {
-            // Log the incoming request details
             _logger.LogInformation($"External login callback received. ReturnUrl: {returnUrl}, ClientType: {clientType}");
 
             var info = await _signInManager.GetExternalLoginInfoAsync();
             if (info == null)
             {
-                _logger.LogError("GetExternalLoginInfoAsync returned null");
-                return BadRequest("Error loading external login information. The external provider did not return the expected information.");
+                _logger.LogError("External login info is null");
+                return Redirect($"{returnUrl}?error=External_login_failed");
             }
 
-            _logger.LogInformation($"External login info received. Provider: {info.LoginProvider}, ProviderKey: {info.ProviderKey}");
-            
-            // Log claims received from the external provider
-            var claims = info.Principal.Claims.Select(c => $"{c.Type}: {c.Value}");
-            _logger.LogInformation($"Claims received: {string.Join(", ", claims)}");
+            // Get the email claim
+            var email = info.Principal.FindFirstValue(ClaimTypes.Email);
+            if (string.IsNullOrEmpty(email))
+            {
+                _logger.LogError("No email claim found");
+                return Redirect($"{returnUrl}?error=No_email_provided");
+            }
 
+            // Find or create the user
+            var user = await _userManager.FindByEmailAsync(email);
+            if (user == null)
+            {
+                // Create the user
+                user = new ApplicationUser
+                {
+                    UserName = email,
+                    Email = email,
+                    EmailConfirmed = true // Since it's confirmed by Google
+                };
+
+                var result = await _userManager.CreateAsync(user);
+                if (!result.Succeeded)
+                {
+                    _logger.LogError($"User creation failed: {string.Join(", ", result.Errors)}");
+                    return Redirect($"{returnUrl}?error=User_creation_failed");
+                }
+            }
+
+            // Add external login if it doesn't exist
+            var externalLoginResult = await _userManager.AddLoginAsync(user, info);
+            if (!externalLoginResult.Succeeded)
+            {
+                _logger.LogError($"Adding external login failed: {string.Join(", ", externalLoginResult.Errors)}");
+                return Redirect($"{returnUrl}?error=External_login_association_failed");
+            }
+
+            // Generate JWT token
             var (success, error, authResult) = await _accountService.HandleExternalLoginAsync(info, clientType);
             if (!success)
             {
-                _logger.LogError($"HandleExternalLoginAsync failed. Error: {error}");
-                return BadRequest(error);
+                _logger.LogError($"Token generation failed: {error}");
+                return Redirect($"{returnUrl}?error=Token_generation_failed");
             }
 
-            _logger.LogInformation("External login successful, building response");
-            return BuildExternalLoginResponse(returnUrl, authResult!);
+            // Redirect back to the SPA with the tokens
+            var queryParams = new Dictionary<string, string>
+            {
+                { "access_token", authResult!.AccessToken },
+                { "refresh_token", authResult.RefreshToken }
+            };
+
+            var uriBuilder = new UriBuilder(returnUrl!);
+            var query = HttpUtility.ParseQueryString(uriBuilder.Query);
+            foreach (var param in queryParams)
+            {
+                query[param.Key] = param.Value;
+            }
+            uriBuilder.Query = query.ToString();
+
+            return Redirect(uriBuilder.ToString());
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "An error occurred during external login callback");
-            return StatusCode(500, $"An error occurred during external login: {ex.Message}");
+            return Redirect($"{returnUrl}?error=Internal_server_error");
         }
     }
 

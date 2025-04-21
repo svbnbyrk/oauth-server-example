@@ -13,6 +13,8 @@ using System.ComponentModel.DataAnnotations;
 using System.Text.Json;
 using OAuthServer.Services;
 using Swashbuckle.AspNetCore.Annotations;
+using System.Net.Http;
+using Microsoft.Extensions.Configuration;
 
 namespace OAuthServer.Controllers;
 
@@ -31,17 +33,26 @@ public class OAuthController : Controller
     private readonly UserManager<ApplicationUser> _userManager;
     private readonly ITokenService _tokenService;
     private readonly IAuthorizationService _authorizationService;
+    private readonly IConfiguration _configuration;
+    private readonly HttpClient _httpClient;
+    private readonly ILogger<OAuthController> _logger;
 
     public OAuthController(
         SignInManager<ApplicationUser> signInManager,
         UserManager<ApplicationUser> userManager,
         ITokenService tokenService,
-        IAuthorizationService authorizationService)
+        IAuthorizationService authorizationService,
+        IConfiguration configuration,
+        HttpClient httpClient,
+        ILogger<OAuthController> logger)
     {
         _signInManager = signInManager;
         _userManager = userManager;
         _tokenService = tokenService;
         _authorizationService = authorizationService;
+        _configuration = configuration;
+        _httpClient = httpClient;
+        _logger = logger;
     }
 
     /// <summary>
@@ -119,6 +130,16 @@ public class OAuthController : Controller
 
                 return Ok(response);
             }
+            else if (request.IsAuthorizationCodeGrantType())
+            {
+                var response = await HandleGoogleAuthorizationCodeGrantType(
+                    request.Code,
+                    request.RedirectUri,
+                    request.ClientId,
+                    request.ClientSecret);
+
+                return Ok(response);
+            }
 
             throw new InvalidOperationException("The specified grant type is not supported.");
         }
@@ -184,6 +205,52 @@ public class OAuthController : Controller
         }
 
         return Redirect(redirectUri!);
+    }
+
+    /// <summary>
+    /// Handles the Google authorization code grant type
+    /// </summary>
+    private async Task<ActionResult> HandleGoogleAuthorizationCodeGrantType(
+        string code,
+        string redirectUri,
+        string clientId,
+        string clientSecret)
+    {
+        var googleTokenUrl = "https://oauth2.googleapis.com/token";
+        var googleClientId = _configuration["Authentication:Google:ClientId"];
+        var googleClientSecret = _configuration["Authentication:Google:ClientSecret"];
+
+        // Validate client credentials
+        if (clientId != googleClientId || clientSecret != googleClientSecret)
+            return BadRequest(new ErrorResponse { Error = "Invalid client credentials" });
+
+        var tokenRequest = new Dictionary<string, string>
+        {
+            {"code", code},
+            {"client_id", googleClientId},
+            {"client_secret", googleClientSecret},
+            {"redirect_uri", redirectUri},
+            {"grant_type", "authorization_code"}
+        };
+
+        var content = new FormUrlEncodedContent(tokenRequest);
+        var response = await _httpClient.PostAsync(googleTokenUrl, content);
+        var responseContent = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            _logger.LogError($"Google token exchange failed: {responseContent}");
+             return BadRequest(new ErrorResponse { Error = "Token exchange failed" });
+        }
+
+        // Forward Google's response
+        var tokenResponse = JsonSerializer.Deserialize<TokenResponse>(responseContent);
+        if (tokenResponse == null)
+        {
+            _logger.LogError("Failed to deserialize token response.");
+             return BadRequest(new ErrorResponse { Error = "Token exchange failed" });
+        }
+        return Ok(tokenResponse);
     }
 
     private static IEnumerable<string> GetDestinations(Claim claim)

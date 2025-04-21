@@ -15,6 +15,8 @@ using Microsoft.AspNetCore.HttpOverrides;
 using System.Net;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.Google;
+using Microsoft.AspNetCore.Authentication.OAuth;
+using OpenIddict.Client.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -29,7 +31,7 @@ builder.Services.AddDbContext<ApplicationDbContext>(options =>
 builder.Services.AddIdentity<ApplicationUser, IdentityRole>()
     .AddEntityFrameworkStores<ApplicationDbContext>()
     .AddDefaultTokenProviders();
-    
+
 // Configure Redis
 var redisConfiguration = builder.Configuration.GetSection("Redis").Get<string>();
 
@@ -54,7 +56,8 @@ builder.Services.AddStackExchangeRedisCache(options =>
 
 builder.Services.Configure<CookiePolicyOptions>(options =>
 {
-    options.MinimumSameSitePolicy = SameSiteMode.Lax; // Allows cookies during cross-origin authentication
+    options.MinimumSameSitePolicy = SameSiteMode.None;
+    options.Secure = CookieSecurePolicy.Always;
 });
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
@@ -62,26 +65,53 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
 builder.Services.AddScoped<IRedisSessionStore, RedisSessionStore>();
 
 builder.Services.AddOpenIddict()
+    // Register the OpenIddict core components.
     .AddCore(options =>
     {
         options.UseEntityFrameworkCore()
                .UseDbContext<ApplicationDbContext>();
     })
+    // Register the OpenIddict server components.
     .AddServer(options =>
     {
-        options.SetTokenEndpointUris("/connect/token");
+        // Enable the authorization and token endpoints.
+        options.SetAuthorizationEndpointUris("connect/authorize")
+               .SetTokenEndpointUris("connect/token");
 
         options.AllowPasswordFlow()
                .AllowRefreshTokenFlow();
 
-        options.AcceptAnonymousClients();
+        // Register the signing and encryption credentials.
+        options.AddDevelopmentEncryptionCertificate()
+               .AddDevelopmentSigningCertificate();
 
-        // Configure your signing credentials here
+        // Register the ASP.NET Core host and configure the ASP.NET Core-specific options.
+        options.UseAspNetCore()
+               .EnableAuthorizationEndpointPassthrough()
+               .EnableTokenEndpointPassthrough();
+
+        // Configure your scopes here (if needed)
+        options.RegisterScopes(Scopes.Email, Scopes.Profile, Scopes.Roles);
+    })
+    .AddClient(options =>
+    {
+        options.AllowAuthorizationCodeFlow();
+
         options.AddDevelopmentEncryptionCertificate()
                .AddDevelopmentSigningCertificate();
 
         options.UseAspNetCore()
-               .EnableTokenEndpointPassthrough();
+               .EnableRedirectionEndpointPassthrough();
+
+        options.UseSystemNetHttp();
+
+        options.UseWebProviders()
+               .AddGitHub(options =>
+               {
+                   options.SetClientId(builder.Configuration["GitHub:ClientId"])
+                          .SetClientSecret(builder.Configuration["GitHub:ClientSecret"])
+                          .SetRedirectUri("callback/login/github");
+               });
     })
     .AddValidation(options =>
     {
@@ -89,71 +119,55 @@ builder.Services.AddOpenIddict()
         options.UseAspNetCore();
     });
 
-// Configure forwarded headers
-builder.Services.Configure<ForwardedHeadersOptions>(options =>
+// Configure authentication
+builder.Services.AddAuthentication(options =>
 {
-    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
-    // Clear default networks first
-    options.KnownNetworks.Clear();
-    options.KnownProxies.Clear();
-    // Add local development network
-    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("::ffff:172.16.1.0"), 120));
-    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("172.16.1.0"), 24));
-    // Add localhost
-    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("::ffff:127.0.0.1"), 120));
-    options.KnownNetworks.Add(new Microsoft.AspNetCore.HttpOverrides.IPNetwork(IPAddress.Parse("127.0.0.1"), 32));
+    options.DefaultScheme = CookieAuthenticationDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = OpenIddictClientAspNetCoreDefaults.AuthenticationScheme;
+})
+.AddCookie(options =>
+{
+    options.LoginPath = "/account/login";
+})
+.AddJwtBearer("Bearer", options =>
+{
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(tokenConfig.SecretKey)),
+        ValidateIssuer = true,
+        ValidIssuer = tokenConfig.Issuer,
+        ValidateAudience = true,
+        ValidAudience = tokenConfig.Audience,
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.Zero
+    };
+})
+.AddGoogle("Google", options =>
+{
+    var googleAuthSection = builder.Configuration.GetSection("Authentication:Google");
+    options.ClientId = googleAuthSection["ClientId"] ?? throw new InvalidOperationException("Google ClientId is missing in configuration");
+    options.ClientSecret = googleAuthSection["ClientSecret"] ?? throw new InvalidOperationException("Google ClientSecret is missing in configuration");
+
+    options.CallbackPath = "/account/callback";
+    
+    options.SaveTokens = true;
+    options.Events = new OAuthEvents
+    {
+        OnCreatingTicket = context =>
+        {
+            var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+            logger.LogInformation("Creating ticket for Google authentication");
+            return Task.CompletedTask;
+        },
+        OnTicketReceived = context =>
+        {
+            var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
+            logger.LogInformation("Successfully received authentication ticket from Google");
+            return Task.CompletedTask;
+        }
+    };
 });
-
-builder.Services.AddAuthentication()
-    .AddJwtBearer(JwtBearerDefaults.AuthenticationScheme, options =>
-    {
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(tokenConfig.SecretKey)),
-            ValidateIssuer = true,
-            ValidIssuer = tokenConfig.Issuer,
-            ValidateAudience = true,
-            ValidAudience = tokenConfig.Audience,
-            ValidateLifetime = true,
-            ClockSkew = TimeSpan.Zero
-        };
-    })
-    .AddGoogle(options =>
-    {
-        var googleAuthSection = builder.Configuration.GetSection("Authentication:Google");
-        options.ClientId = googleAuthSection["ClientId"] ?? throw new InvalidOperationException("Google ClientId is missing in configuration");
-        options.ClientSecret = googleAuthSection["ClientSecret"] ?? throw new InvalidOperationException("Google ClientSecret is missing in configuration");
-
-        options.Scope.Add("profile");
-        options.Scope.Add("email");
-
-        options.CallbackPath = "/account/callback";
-        options.SaveTokens = true;
-
-        options.Events = new Microsoft.AspNetCore.Authentication.OAuth.OAuthEvents
-        {
-            OnTicketReceived = context =>
-            {
-                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
-                logger.LogInformation("Authentication ticket received successfully");
-                return Task.CompletedTask;
-            },
-
-            OnRemoteFailure = context =>
-            {
-                var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
-                logger.LogError($"Remote authentication failed: {context.Failure?.Message}");
-                return Task.CompletedTask;
-            }
-        };
-    })
-    .AddFacebook(options =>
-    {
-        var facebookAuthSection = builder.Configuration.GetSection("Authentication:Facebook");
-        options.AppId = facebookAuthSection["AppId"] ?? throw new InvalidOperationException("Facebook AppId is missing in configuration");
-        options.AppSecret = facebookAuthSection["AppSecret"] ?? throw new InvalidOperationException("Facebook AppSecret is missing in configuration");
-    });
 
 // Configure CORS
 builder.Services.AddCors(options =>
@@ -163,6 +177,18 @@ builder.Services.AddCors(options =>
         policy.WithOrigins("http://localhost:5250", "https://localhost:5251", "http://localhost:62128") // Add your client application URLs here
               .AllowAnyHeader()
               .AllowAnyMethod()
+              .AllowCredentials();
+    });
+});
+
+// Configure CORS for your SPA
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowSPA", policy =>
+    {
+        policy.WithOrigins("http://localhost:3000") // Update with your SPA URL
+              .AllowAnyMethod()
+              .AllowAnyHeader()
               .AllowCredentials();
     });
 });
@@ -239,31 +265,18 @@ var app = builder.Build();
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
-    app.UseDeveloperExceptionPage();
     app.UseSwagger();
-    app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "OAuth Server API v1"));
+    app.UseSwaggerUI();
 }
 
-// Add forwarded headers middleware early in the pipeline
-app.UseForwardedHeaders();
-
-// Enable HTTPS redirection
 app.UseHttpsRedirection();
 
-app.UseRouting();
+// Use CORS before authentication
+app.UseCors("AllowSPA");
 
-app.UseCors();
-
+// Authentication & Authorization
 app.UseAuthentication();
-
 app.UseAuthorization();
-
-app.UseForwardedHeaders(new ForwardedHeadersOptions
-{
-    ForwardedHeaders = ForwardedHeaders.XForwardedProto
-});
-
-app.UseCookiePolicy();
 
 app.MapControllers();
 
